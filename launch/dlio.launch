@@ -15,6 +15,12 @@
   <arg name="robot_namespace" default="robot"/>
   <arg name="rviz" default="false"/>
 
+  <!-- Extrinsics config to load; one per sequence, since baselink2lidar differs. -->
+  <arg name="extrinsics" default="dlio.yaml"/>
+
+  <!-- Where the estimated trajectory is written, TUM layout. Empty = off. -->
+  <arg name="trajectory_path" default=""/>
+
   <arg name="pointcloud_topic" default="lidar"/>
   <arg name="imu_topic" default="imu"/>
 
@@ -22,8 +28,9 @@
   <node ns="$(arg robot_namespace)" name="dlio_odom" pkg="direct_lidar_inertial_odometry" type="dlio_odom_node" output="screen" clear_params="true">
 
     <!-- Load parameters -->
-    <rosparam file="$(find direct_lidar_inertial_odometry)/cfg/dlio.yaml" command="load"/>
+    <rosparam file="$(find direct_lidar_inertial_odometry)/cfg/$(arg extrinsics)" command="load"/>
     <rosparam file="$(find direct_lidar_inertial_odometry)/cfg/params.yaml" command="load"/>
+    <param name="dlio/odom/trajectory/path" value="$(arg trajectory_path)"/>
 
     <!-- Subscriptions -->
     <remap from="~pointcloud" to="$(arg pointcloud_topic)"/>
@@ -36,6 +43,9 @@
     <remap from="~kf_pose"  to="dlio/odom_node/keyframes"/>
     <remap from="~kf_cloud" to="dlio/odom_node/pointcloud/keyframe"/>
     <remap from="~deskewed" to="dlio/odom_node/pointcloud/deskewed"/>
+    <remap from="~submap"    to="dlio/odom_node/submap"/>
+    <remap from="~submap_kf" to="dlio/odom_node/submap_kf"/>
+    <remap from="~stats"     to="dlio/odom_node/stats"/>
 
   </node>
 
@@ -43,7 +53,7 @@
   <node ns="$(arg robot_namespace)" name="dlio_map" pkg="direct_lidar_inertial_odometry" type="dlio_map_node" output="screen" clear_params="true">
 
     <!-- Load parameters -->
-    <rosparam file="$(find direct_lidar_inertial_odometry)/cfg/dlio.yaml" command="load"/>
+    <rosparam file="$(find direct_lidar_inertial_odometry)/cfg/$(arg extrinsics)" command="load"/>
     <rosparam file="$(find direct_lidar_inertial_odometry)/cfg/params.yaml" command="load"/>
 
     <!-- Subscriptions -->

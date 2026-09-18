@@ -11,6 +11,9 @@
  ***********************************************************/
 
 #include "dlio/dlio.h"
+#include "dlio/ivox_target.h"
+
+#include <jsk_rviz_plugins/OverlayText.h>
 
 class dlio::OdomNode {
 
@@ -77,6 +80,11 @@ private:
   void computeConcaveHull();
   void pushSubmapIndices(std::vector<float> dists, int k, std::vector<int> frames);
   void buildSubmap(State vehicle_state);
+  void insertScanIntoIVox();
+  void updateAdaptiveLeaf(const pcl::PointCloud<PointType>& probe);
+  double correspondenceFromLeaf() const;
+  void publishIVox();
+  void publishStats();
   void buildKeyframesAndSubmap(State vehicle_state);
   void pauseSubmapBuildIfNeeded();
 
@@ -96,6 +104,12 @@ private:
   ros::Publisher kf_pose_pub;
   ros::Publisher kf_cloud_pub;
   ros::Publisher deskewed_pub;
+  // The submap GICP registers against, and which keyframes it was built from.
+  // Published whenever the selection changes, so a wrong pick (a keyframe from
+  // the floor below, say) shows up as the cloud and the markers it came from.
+  ros::Publisher submap_pub;
+  ros::Publisher submap_kf_pub;
+  ros::Publisher stats_pub;
 
   // ROS Msgs
   nav_msgs::Odometry odom_ros;
@@ -121,6 +135,12 @@ private:
 
   // Trajectory
   std::vector<std::pair<Eigen::Vector3f, Eigen::Quaternionf>> trajectory;
+
+  // Estimated trajectory written as it runs, in the same TUM layout the
+  // SuperLoc ground truth uses: stamp tx ty tz qx qy qz qw.
+  std::string trajectory_path_;
+  std::ofstream trajectory_file;
+  void writeTrajectoryPose();
   double length_traversed;
 
   // Keyframes
@@ -165,6 +185,56 @@ private:
 
   std::vector<int> submap_kf_idx_curr;
   std::vector<int> submap_kf_idx_prev;
+
+  // GICP target map backend: "submap" (keyframes + kd-tree) or "ivox"
+  // (an incremental voxel map updated in place after every scan).
+  std::string map_backend_;
+  std::shared_ptr<dlio::IVoxMap> ivox_map;
+  double ivox_resolution_;
+  double ivox_min_dist_in_cell_;
+  int ivox_max_points_in_cell_;
+  int ivox_lru_horizon_;
+  int ivox_lru_clear_cycle_;
+  std::string ivox_insert_policy_;
+  int ivox_search_offsets_;
+  double ivox_insert_downsample_;
+  double ivox_eviction_radius_;
+
+  // Keep the voxelized scan inside a point-count band. The fixed leaf is used
+  // first; too many points are sampled down, too few are re-voxelized finer.
+  bool   scan_points_enabled_;
+  int    scan_points_min_;
+  int    scan_points_max_;
+  double scan_points_fine_leaf_;
+  int    scan_points_used_;
+
+  // Scale-aware adaptive voxelization, after GenZ-LIO (arXiv:2603.16273).
+  // A PD controller drives the voxel leaf so the voxelized scan holds a point
+  // count that suits how open the scene is.
+  bool   target_points_enabled_;
+  int    target_points_min_;
+  int    target_points_max_;
+  double target_open_range_;
+  double target_exponent_;
+  int    target_window_;
+  double target_leaf_min_;
+  double target_leaf_max_;
+  double target_lambda_p_;
+  double target_lambda_d_;
+  double target_kp_min_;
+  double target_kp_max_;
+  double target_kd_min_;
+  double target_kd_max_;
+  double adaptive_leaf_;
+  double last_target_points_;
+  std::deque<double> range_window_;
+  double target_prev_error_;
+  bool   target_have_prev_error_;
+
+  // Tie the GICP correspondence distance to the leaf the scan was voxelized
+  // with, instead of the two-valued spaciousness step.
+  bool   corr_from_leaf_;
+  double corr_leaf_ratio_;
 
   bool new_submap_is_ready;
   std::future<void> submap_future;

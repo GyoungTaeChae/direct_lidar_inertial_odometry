@@ -44,6 +44,39 @@ dlio:
       voxelFilter:
         res: 0.25
 
+      # Keep the voxelized scan inside a point-count band. The leaf above is
+      # used first; a sweep that survives it too densely is sampled down, one
+      # that survives too sparsely is re-voxelized from raw at fineLeaf.
+      scanPoints:
+        enabled: true
+        min: 1000
+        max: 6000
+        fineLeaf: 0.1
+
+      # Scale-aware adaptive voxelization, after GenZ-LIO (arXiv:2603.16273).
+      # A PD controller moves the voxel leaf so the voxelized scan holds a point
+      # count that suits the scene: few points in a corridor, more in the open.
+      # The scanPoints band above still applies on top of whatever it produces.
+      targetPoints:
+        enabled: true
+        min: 1000        # pts, the count a fully enclosed scene settles on
+        max: 4000        # pts, the count an open scene settles on
+        openRange: 30.0  # m, median range at which the target saturates
+        exponent: 2.0    # how fast the target climbs as the walls come off
+        window: 5        # scans the median range is averaged over
+        leafMin: 0.02    # m, finest leaf the controller may ask for
+        leafMax: 1.00    # m, coarsest
+        lambdaP: 0.1     # error normalizer, as a fraction of the target
+        lambdaD: 0.2     # error-rate normalizer, same but per second
+        kpMin: 1.0e-6
+        kpMax: 1.0e-4
+        kdMin: 1.0e-9
+        kdMax: 1.0e-7
+        # Stock DLIO voxelizes at 0.25 m and matches against 0.5 * 0.5 = 0.25 m,
+        # one voxel. Keep that relation as the leaf moves.
+        corrFromLeaf: true
+        corrLeafRatio: 1.0
+
     keyframe:
       threshD: 1.0
       threshR: 45.0
@@ -53,6 +86,27 @@ dlio:
         knn: 10
         kcv: 10
         kcc: 10
+
+    # GICP target map. "ivox" (default) keeps one incremental voxel map that
+    # every scan is inserted into, so the target is the recent neighbourhood.
+    # "submap" is stock DLIO: a cloud stitched from the knn / convex-hull /
+    # concave-hull keyframes above, which can reach onto another floor. The
+    # keyframe counts above apply to "submap" only.
+    map:
+      backend: ivox
+      ivox:
+        resolution: 0.5
+        minDistInCell: 0.1
+        maxPointsInCell: 5
+        # Distance is the primary rule, the way GenZ-ICP trims its local map.
+        # The LRU horizon is left as a loose safety net so it does not fire
+        # first. Memory goes as radius cubed, and as maxPointsInCell linearly.
+        evictionRadius: 300.0
+        lruHorizon: 100000
+        lruClearCycle: 1
+        insertPolicy: first_come
+        searchOffsets: 7
+        insertDownsample: 1.0
     gicp:
       minNumPoints: 64
       kCorrespondences: 16

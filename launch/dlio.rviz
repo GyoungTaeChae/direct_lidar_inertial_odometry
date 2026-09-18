@@ -35,6 +35,33 @@ Toolbars:
 Visualization Manager:
   Class: ""
   Displays:
+    - Alpha: 0.6
+      Class: rviz/PointCloud2
+      Color: 255; 140; 25
+      Color Transformer: FlatColor
+      Enabled: true
+      Name: GICP target map
+      Position Transformer: XYZ
+      Queue Size: 1
+      Size (m): 0.05
+      Style: Points
+      Topic: /robot/dlio/odom_node/submap
+      Use Fixed Frame: true
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /robot/dlio/odom_node/submap_kf
+      Name: Submap keyframes
+      Queue Size: 1
+      Value: true
+    - Class: jsk_rviz_plugin/OverlayText
+      Enabled: true
+      Name: Stats
+      Topic: /robot/dlio/odom_node/stats
+      Value: true
+      align bottom: false
+      overtake color properties: false
+      overtake position properties: false
     - Class: rviz/Group
       Displays:
         - Class: rviz/TF

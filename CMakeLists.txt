@@ -43,8 +43,10 @@ find_package(catkin REQUIRED COMPONENTS
   sensor_msgs
   geometry_msgs
   nav_msgs
+  visualization_msgs
   pcl_ros
   message_generation
+  jsk_rviz_plugins   # OverlayText: the only way to pin text to the rviz window
 )
 
 add_service_files(

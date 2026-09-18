@@ -18,7 +18,9 @@
 #endif
 
 #include <ctime>
+#include <deque>
 #include <fstream>
+#include <unistd.h>
 #include <future>
 #include <iomanip>
 #include <ios>
@@ -52,6 +54,7 @@ std::string to_string_with_precision(const T a_value, const int n = 6)
 #include <nav_msgs/Path.h>
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/PointCloud2.h>
+#include <visualization_msgs/MarkerArray.h>
 #include <tf2_ros/transform_broadcaster.h>
 
 // BOOST
@@ -65,6 +68,7 @@ std::string to_string_with_precision(const T a_value, const int n = 6)
 #define PCL_NO_PRECOMPILE
 #include <pcl/filters/crop_box.h>
 #include <pcl/filters/voxel_grid.h>
+#include <pcl/filters/random_sample.h>
 #include <pcl/filters/statistical_outlier_removal.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/surface/concave_hull.h>

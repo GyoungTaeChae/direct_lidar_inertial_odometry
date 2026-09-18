@@ -37,6 +37,9 @@ dlio::OdomNode::OdomNode(ros::NodeHandle node_handle) : nh(node_handle) {
   this->kf_pose_pub  = this->nh.advertise<geometry_msgs::PoseArray>("kf_pose", 1, true);
   this->kf_cloud_pub = this->nh.advertise<sensor_msgs::PointCloud2>("kf_cloud", 1, true);
   this->deskewed_pub = this->nh.advertise<sensor_msgs::PointCloud2>("deskewed", 1, true);
+  this->submap_pub    = this->nh.advertise<sensor_msgs::PointCloud2>("submap", 1, true);
+  this->submap_kf_pub = this->nh.advertise<visualization_msgs::MarkerArray>("submap_kf", 1, true);
+  this->stats_pub     = this->nh.advertise<jsk_rviz_plugins::OverlayText>("stats", 1, true);
 
   this->publish_timer = this->nh.createTimer(ros::Duration(0.01), &dlio::OdomNode::publishPose, this);
 
@@ -302,6 +305,115 @@ void dlio::OdomNode::getParams() {
   ros::param::param<double>("~dlio/odom/geo/gbias_max", this->geo_gbias_max_, 1.0);
 
   ros::param::param<bool>("~dlio/verbose", this->verbose, true);
+
+  // Where to write the estimated trajectory. Empty means do not write one.
+  ros::param::param<std::string>("~dlio/odom/trajectory/path", this->trajectory_path_, std::string(""));
+  if (!this->trajectory_path_.empty()) {
+    this->trajectory_file.open(this->trajectory_path_, std::ios::out | std::ios::trunc);
+    if (this->trajectory_file.is_open()) {
+      ROS_INFO("[dlio] trajectory: %s", this->trajectory_path_.c_str());
+    } else {
+      ROS_WARN("[dlio] cannot write trajectory to %s", this->trajectory_path_.c_str());
+    }
+  }
+
+  // GICP target map. "submap" keeps the keyframe submap + kd-tree; "ivox"
+  // replaces it with an incremental voxel map updated after every scan.
+  ros::param::param<std::string>("~dlio/odom/map/backend", this->map_backend_, std::string("ivox"));
+  ros::param::param<double>("~dlio/odom/map/ivox/resolution", this->ivox_resolution_, 0.5);
+  ros::param::param<double>("~dlio/odom/map/ivox/minDistInCell", this->ivox_min_dist_in_cell_, 0.1);
+  ros::param::param<int>("~dlio/odom/map/ivox/maxPointsInCell", this->ivox_max_points_in_cell_, 20);
+  ros::param::param<int>("~dlio/odom/map/ivox/lruHorizon", this->ivox_lru_horizon_, 100);
+  // 1 sweeps a slice of the map every insert, so indices are tombstoned and
+  // nothing rehashes. Above 1 restores the vendored bulk sweep, which drops a
+  // tenth of the map at once; kept only to reproduce that.
+  ros::param::param<int>("~dlio/odom/map/ivox/lruClearCycle", this->ivox_lru_clear_cycle_, 1);
+  // Which point survives when two land close together in a cell. "first_come"
+  // lets the scan that saw a surface first hold the cell, usually the distant,
+  // noisier look at it; "center" is order-independent.
+  ros::param::param<std::string>("~dlio/odom/map/ivox/insertPolicy", this->ivox_insert_policy_,
+      std::string("first_come"));
+  ros::param::param<int>("~dlio/odom/map/ivox/searchOffsets", this->ivox_search_offsets_, 7);
+  ros::param::param<double>("~dlio/odom/map/ivox/insertDownsample", this->ivox_insert_downsample_, 1.0);
+  // Drop voxels this far from the robot, the way GenZ-ICP and FAST-LIO2 trim
+  // their local maps. 0 leaves the LRU horizon as the only rule.
+  ros::param::param<double>("~dlio/odom/map/ivox/evictionRadius", this->ivox_eviction_radius_, 0.0);
+
+  // Keep the voxelized scan inside a point-count band, instead of letting the
+  // fixed leaf decide how much survives in a sparse or a dense sweep.
+  ros::param::param<bool>("~dlio/odom/preprocessing/scanPoints/enabled",
+                          this->scan_points_enabled_, false);
+  ros::param::param<int>("~dlio/odom/preprocessing/scanPoints/min", this->scan_points_min_, 1000);
+  ros::param::param<int>("~dlio/odom/preprocessing/scanPoints/max", this->scan_points_max_, 6000);
+  ros::param::param<double>("~dlio/odom/preprocessing/scanPoints/fineLeaf",
+                            this->scan_points_fine_leaf_, 0.1);
+  this->scan_points_used_ = 0;
+
+  // Scale-aware adaptive voxelization. The leaf chases a point count that rises
+  // with how open the scene is, instead of staying at the fixed vf_res_.
+  ros::param::param<bool>("~dlio/odom/preprocessing/targetPoints/enabled",
+                          this->target_points_enabled_, false);
+  ros::param::param<int>("~dlio/odom/preprocessing/targetPoints/min", this->target_points_min_, 1000);
+  ros::param::param<int>("~dlio/odom/preprocessing/targetPoints/max", this->target_points_max_, 4000);
+  ros::param::param<double>("~dlio/odom/preprocessing/targetPoints/openRange", this->target_open_range_, 30.0);
+  ros::param::param<double>("~dlio/odom/preprocessing/targetPoints/exponent", this->target_exponent_, 2.0);
+  ros::param::param<int>("~dlio/odom/preprocessing/targetPoints/window", this->target_window_, 5);
+  ros::param::param<double>("~dlio/odom/preprocessing/targetPoints/leafMin", this->target_leaf_min_, 0.02);
+  ros::param::param<double>("~dlio/odom/preprocessing/targetPoints/leafMax", this->target_leaf_max_, 1.00);
+  ros::param::param<double>("~dlio/odom/preprocessing/targetPoints/lambdaP", this->target_lambda_p_, 0.1);
+  ros::param::param<double>("~dlio/odom/preprocessing/targetPoints/lambdaD", this->target_lambda_d_, 0.2);
+  ros::param::param<double>("~dlio/odom/preprocessing/targetPoints/kpMin", this->target_kp_min_, 1e-6);
+  ros::param::param<double>("~dlio/odom/preprocessing/targetPoints/kpMax", this->target_kp_max_, 1e-4);
+  ros::param::param<double>("~dlio/odom/preprocessing/targetPoints/kdMin", this->target_kd_min_, 1e-9);
+  ros::param::param<double>("~dlio/odom/preprocessing/targetPoints/kdMax", this->target_kd_max_, 1e-7);
+  // Stock DLIO voxelizes at 0.25 m and, through adaptive, matches against
+  // 0.5 * 0.5 = 0.25 m. The two are the same number, so the correspondence
+  // distance reads as one voxel. Keep that relation when the leaf moves.
+  ros::param::param<bool>("~dlio/odom/preprocessing/targetPoints/corrFromLeaf",
+                          this->corr_from_leaf_, true);
+  ros::param::param<double>("~dlio/odom/preprocessing/targetPoints/corrLeafRatio",
+                            this->corr_leaf_ratio_, 1.0);
+  // The controller starts from the fixed leaf, so scan one is what it would
+  // have been without it.
+  this->adaptive_leaf_ = this->vf_res_;
+  this->last_target_points_ = 0.0;
+  this->target_prev_error_ = 0.0;
+  this->target_have_prev_error_ = false;
+  if (this->target_points_enabled_) {
+    ROS_INFO("[dlio] adaptive voxelization: %d-%d pts, open %.1f m, leaf %.2f-%.2f m, corr=%.2fx leaf",
+             this->target_points_min_, this->target_points_max_, this->target_open_range_,
+             this->target_leaf_min_, this->target_leaf_max_, this->corr_leaf_ratio_);
+  }
+
+  if (this->scan_points_enabled_) {
+    ROS_INFO("[dlio] scan points: %d-%d, leaf %.2f m, fine leaf %.2f m",
+             this->scan_points_min_, this->scan_points_max_, this->vf_res_,
+             this->scan_points_fine_leaf_);
+  }
+
+  if (this->map_backend_ == "ivox") {
+    this->ivox_map = std::make_shared<dlio::IVoxMap>(this->ivox_resolution_);
+    this->ivox_map->voxel_setting.min_sq_dist_in_cell =
+        this->ivox_min_dist_in_cell_ * this->ivox_min_dist_in_cell_;
+    this->ivox_map->voxel_setting.max_num_points_in_cell = this->ivox_max_points_in_cell_;
+    this->ivox_map->voxel_setting.policy = (this->ivox_insert_policy_ == "center")
+        ? dlio::IVoxContainer::InsertPolicy::CenterPreference
+        : dlio::IVoxContainer::InsertPolicy::FirstCome;
+    this->ivox_map->lru_horizon = this->ivox_lru_horizon_;
+    this->ivox_map->lru_clear_cycle = this->ivox_lru_clear_cycle_;
+    this->ivox_map->set_search_offsets(this->ivox_search_offsets_);
+    this->ivox_map->eviction_radius = this->ivox_eviction_radius_;
+    // Nothing reads the pcl kd-tree over the stub target, so do not build it.
+    this->gicp.setSkipPclTargetTree(true);
+    ROS_INFO("[dlio] target map: iVox res=%.2f min_dist=%.2f max_pts=%d lru=%d "
+             "offsets=%d keep=%.2f policy=%s radius=%.1f",
+             this->ivox_resolution_, this->ivox_min_dist_in_cell_, this->ivox_max_points_in_cell_,
+             this->ivox_lru_horizon_, this->ivox_search_offsets_, this->ivox_insert_downsample_,
+             this->ivox_insert_policy_.c_str(), this->ivox_eviction_radius_);
+  } else {
+    ROS_INFO("[dlio] target map: keyframe submap knn=%d kcv=%d kcc=%d",
+             this->submap_knn_, this->submap_kcv_, this->submap_kcc_);
+  }
 }
 
 void dlio::OdomNode::start() {
@@ -583,15 +695,141 @@ void dlio::OdomNode::preprocessPoints() {
 
   // Voxel Grid Filter
   if (this->vf_use_) {
+    // The controller reads a throwaway voxelization at the previous leaf, then
+    // the scan is voxelized again at the leaf that produced. Measuring the leaf
+    // this scan already used would put the correction one scan behind what it
+    // is correcting.
+    if (this->target_points_enabled_) {
+      pcl::PointCloud<PointType>::Ptr probe
+        (boost::make_shared<pcl::PointCloud<PointType>>(*this->deskewed_scan));
+      this->voxel.setLeafSize(this->adaptive_leaf_, this->adaptive_leaf_, this->adaptive_leaf_);
+      this->voxel.setInputCloud(probe);
+      this->voxel.filter(*probe);
+      if (!probe->empty()) {
+        this->updateAdaptiveLeaf(*probe);
+      }
+    }
+
+    const double leaf = this->target_points_enabled_ ? this->adaptive_leaf_ : this->vf_res_;
     pcl::PointCloud<PointType>::Ptr current_scan_
       (boost::make_shared<pcl::PointCloud<PointType>>(*this->deskewed_scan));
+    this->voxel.setLeafSize(leaf, leaf, leaf);
     this->voxel.setInputCloud(current_scan_);
     this->voxel.filter(*current_scan_);
+
+    if (this->scan_points_enabled_) {
+      // Too dense: thin at random rather than with a coarser leaf, which would
+      // drop the far returns first, exactly the ones that hold the geometry.
+      if (static_cast<int>(current_scan_->size()) > this->scan_points_max_) {
+        pcl::RandomSample<PointType> sample;
+        // Fixed seed: the same bag has to produce the same run twice.
+        sample.setSeed(1);
+        sample.setSample(static_cast<unsigned int>(this->scan_points_max_));
+        sample.setInputCloud(current_scan_);
+        pcl::PointCloud<PointType>::Ptr capped
+          (boost::make_shared<pcl::PointCloud<PointType>>());
+        sample.filter(*capped);
+        current_scan_ = capped;
+
+      // Too sparse: go back to the sweep as it arrived and take a finer leaf.
+      // Re-voxelizing what the coarse leaf already left would gain nothing.
+      } else if (static_cast<int>(current_scan_->size()) < this->scan_points_min_) {
+        pcl::PointCloud<PointType>::Ptr fine
+          (boost::make_shared<pcl::PointCloud<PointType>>(*this->deskewed_scan));
+        this->voxel.setLeafSize(this->scan_points_fine_leaf_, this->scan_points_fine_leaf_,
+                                this->scan_points_fine_leaf_);
+        this->voxel.setInputCloud(fine);
+        this->voxel.filter(*fine);
+        current_scan_ = fine;
+      }
+    }
+
+    this->scan_points_used_ = current_scan_->size();
     this->current_scan = current_scan_;
+    // setAdaptiveParams() runs after this and would otherwise overwrite it;
+    // it defers to the same helper when corr_from_leaf_ is on.
+    if (this->corr_from_leaf_ && this->target_points_enabled_) {
+      this->gicp.setMaxCorrespondenceDistance(this->correspondenceFromLeaf());
+    }
   } else {
     this->current_scan = this->deskewed_scan;
   }
 
+}
+
+// The correspondence distance the current leaf implies. Stock DLIO matches
+// against one voxel of the fixed leaf; this keeps that relation as the leaf
+// moves, so a finer scan is matched more tightly and a coarser one loosely.
+double dlio::OdomNode::correspondenceFromLeaf() const {
+  return this->corr_leaf_ratio_ * this->adaptive_leaf_;
+}
+
+// Scale-aware adaptive voxelization, after GenZ-LIO (arXiv:2603.16273)
+// Algorithm 1. Given a throwaway voxelization at the current leaf, this sets
+// the leaf the scan is then voxelized with for real.
+void dlio::OdomNode::updateAdaptiveLeaf(const pcl::PointCloud<PointType>& probe) {
+
+  // --- scale indicator -----------------------------------------------------
+  // How far the sensor can see, as the median range of what it just saw. A
+  // corridor reads a couple of metres, an open road tens of them. Averaged
+  // over the last few scans so one odd sweep does not move the target.
+  const Eigen::Vector3f origin = this->T_prior.block<3, 1>(0, 3);
+  std::vector<float> ranges;
+  ranges.reserve(probe.size());
+  for (const auto& point : probe.points) {
+    ranges.push_back((point.getVector3fMap() - origin).norm());
+  }
+  std::nth_element(ranges.begin(), ranges.begin() + ranges.size() / 2, ranges.end());
+  this->range_window_.push_back(ranges[ranges.size() / 2]);
+  while (static_cast<int>(this->range_window_.size()) > std::max(1, this->target_window_)) {
+    this->range_window_.pop_front();
+  }
+  double scale = 0.0;
+  for (double r : this->range_window_) scale += r;
+  scale /= this->range_window_.size();
+
+  // --- setpoint ------------------------------------------------------------
+  // Rises with the scale and saturates at target_open_range_. The exponent
+  // makes it climb quickly as soon as the walls come off and then level out,
+  // and leaves the slope at zero on the boundary so the target does not kink
+  // there and jolt the derivative term.
+  double desired = this->target_points_max_;
+  if (scale < this->target_open_range_) {
+    const double rho = 1.0 - std::pow(1.0 - scale / this->target_open_range_, this->target_exponent_);
+    desired = this->target_points_min_ + (this->target_points_max_ - this->target_points_min_) * rho;
+  }
+
+  // --- tracking error ------------------------------------------------------
+  const double dt = std::max(this->scan_stamp - this->prev_scan_stamp, 1e-3);
+  const double error = desired - static_cast<double>(probe.size());
+  const double error_rate =
+      this->target_have_prev_error_ ? (error - this->target_prev_error_) / dt : 0.0;
+  this->target_prev_error_ = error;
+  this->target_have_prev_error_ = true;
+
+  // --- gain scheduling -----------------------------------------------------
+  // Each gain is the geometric mean of two normalized quantities: how open the
+  // scene is, and how far off (or how fast moving) the count is. Taking both
+  // gives a gain higher than the scene alone would allow, so a large error is
+  // still chased, yet lower than the error alone would ask for, so a corridor
+  // where the count is touchy does not oscillate.
+  const double phi = std::min(scale, this->target_open_range_) / this->target_open_range_;
+  const double p_span = std::max(this->target_lambda_p_ * desired, 1.0);
+  const double d_span = std::max(this->target_lambda_d_ * desired / dt, 1.0);
+  const double psi_p = std::min(std::abs(error), p_span) / p_span;
+  const double psi_d = std::min(std::abs(error_rate), d_span) / d_span;
+  const double kp = this->target_kp_min_ +
+                    (this->target_kp_max_ - this->target_kp_min_) * std::sqrt(phi * psi_p);
+  const double kd = this->target_kd_min_ +
+                    (this->target_kd_max_ - this->target_kd_min_) * std::sqrt(phi * psi_d);
+
+  // --- leaf update ---------------------------------------------------------
+  // Both terms are negative because count and leaf move opposite ways: too few
+  // points is a positive error and calls for a finer leaf.
+  const double step = -kp * error - kd * error_rate;
+  this->adaptive_leaf_ = std::min(std::max(this->adaptive_leaf_ + step, this->target_leaf_min_),
+                                  this->target_leaf_max_);
+  this->last_target_points_ = desired;
 }
 
 void dlio::OdomNode::deskewPointcloud() {
@@ -806,6 +1044,7 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::PointCloud2ConstPtr& 
   // Set initial frame as first keyframe
   if (this->keyframes.size() == 0) {
     this->initializeInputTarget();
+    this->insertScanIntoIVox();
     this->main_loop_running = false;
     this->submap_future =
       std::async( std::launch::async, &dlio::OdomNode::buildKeyframesAndSubmap, this, this->state );
@@ -815,6 +1054,10 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::PointCloud2ConstPtr& 
 
   // Get the next pose via IMU + S2M + GEO
   this->getNextPose();
+
+  // Push the aligned scan into the iVox before the submap thread starts, so
+  // the map the next scan aligns against already contains this one.
+  this->insertScanIntoIVox();
 
   // Update current keyframe poses and map
   this->updateKeyframes();
@@ -833,6 +1076,8 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::PointCloud2ConstPtr& 
 
   // Update trajectory
   this->trajectory.push_back( std::make_pair(this->state.p, this->state.q) );
+  this->writeTrajectoryPose();
+  this->publishStats();
 
   // Update time stamps
   this->lidar_rates.push_back( 1. / (this->scan_stamp - this->prev_scan_stamp) );
@@ -1012,7 +1257,20 @@ void dlio::OdomNode::getNextPose() {
   // Check if the new submap is ready to be used
   this->new_submap_is_ready = (this->submap_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready);
 
-  if (this->new_submap_is_ready && this->submap_hasChanged) {
+  if (this->map_backend_ == "ivox") {
+
+    // The iVox is updated in place after every scan, so there is nothing to
+    // swap in here; it only has to be attached once. pcl::Registration still
+    // refuses to run without *some* target cloud, so it gets a stub it never
+    // reads -- every target lookup goes through the iVox.
+    if (!this->gicp.target_ivox_) {
+      pcl::PointCloud<PointType>::Ptr stub (boost::make_shared<pcl::PointCloud<PointType>>());
+      stub->push_back(PointType());
+      this->gicp.registerInputTarget(stub);
+      this->gicp.setTargetIVox(this->ivox_map);
+    }
+
+  } else if (this->new_submap_is_ready && this->submap_hasChanged) {
 
     // Set the current global submap as the target cloud
     this->gicp.registerInputTarget(this->submap_cloud);
@@ -1644,8 +1902,14 @@ void dlio::OdomNode::setAdaptiveParams() {
   if (den < 0.5*this->gicp_max_corr_dist_) { den = 0.5*this->gicp_max_corr_dist_; }
   if (den > 2.0*this->gicp_max_corr_dist_) { den = 2.0*this->gicp_max_corr_dist_; }
 
-  if (sp_raw < 5.0) { den = 0.5*this->gicp_max_corr_dist_; };
-  if (sp_raw > 5.0) { den = 2.0*this->gicp_max_corr_dist_; };
+  if (this->corr_from_leaf_ && this->target_points_enabled_) {
+    // The leaf already says how coarse this scan is; the spaciousness step
+    // would only overwrite that with a two-valued guess at the same thing.
+    den = this->correspondenceFromLeaf();
+  } else {
+    if (sp_raw < 5.0) { den = 0.5*this->gicp_max_corr_dist_; };
+    if (sp_raw > 5.0) { den = 2.0*this->gicp_max_corr_dist_; };
+  }
 
   this->gicp.setMaxCorrespondenceDistance(den);
 
@@ -1770,6 +2034,64 @@ void dlio::OdomNode::buildSubmap(State vehicle_state) {
 
     this->submap_kf_idx_prev = this->submap_kf_idx_curr;
   }
+
+  // Show what GICP registers against, on every scan rather than only when
+  // the selection changes, so rviz never keeps a stale submap. The cloud is
+  // the submap itself; the markers are the keyframes it was built from.
+  if (this->submap_pub.getNumSubscribers() == 0 &&
+      this->submap_kf_pub.getNumSubscribers() == 0) {
+    return;
+  }
+  this->pauseSubmapBuildIfNeeded();
+
+  sensor_msgs::PointCloud2 submap_ros;
+  pcl::toROSMsg(*this->submap_cloud, submap_ros);
+  submap_ros.header.stamp = this->scan_header_stamp;
+  submap_ros.header.frame_id = this->odom_frame;
+  this->submap_pub.publish(submap_ros);
+
+  visualization_msgs::MarkerArray kf_markers;
+  visualization_msgs::Marker clear;
+  clear.action = visualization_msgs::Marker::DELETEALL;
+  kf_markers.markers.push_back(clear);
+
+  visualization_msgs::Marker spheres;
+  spheres.header.stamp = this->scan_header_stamp;
+  spheres.header.frame_id = this->odom_frame;
+  spheres.ns = "submap_kf";
+  spheres.id = 0;
+  spheres.type = visualization_msgs::Marker::SPHERE_LIST;
+  spheres.action = visualization_msgs::Marker::ADD;
+  spheres.pose.orientation.w = 1.0;
+  spheres.scale.x = spheres.scale.y = spheres.scale.z = 0.4;
+  spheres.color.r = 1.0; spheres.color.g = 0.55; spheres.color.b = 0.1; spheres.color.a = 0.9;
+
+  lock.lock();
+  int marker_id = 1;
+  for (auto k : this->submap_kf_idx_curr) {
+    const Eigen::Vector3f& p = this->keyframes[k].first.first;
+    geometry_msgs::Point pt;
+    pt.x = p[0]; pt.y = p[1]; pt.z = p[2];
+    spheres.points.push_back(pt);
+
+    visualization_msgs::Marker label;
+    label.header = spheres.header;
+    label.ns = "submap_kf_label";
+    label.id = marker_id++;
+    label.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+    label.action = visualization_msgs::Marker::ADD;
+    label.pose.position.x = p[0];
+    label.pose.position.y = p[1];
+    label.pose.position.z = p[2] + 0.5;
+    label.pose.orientation.w = 1.0;
+    label.scale.z = 0.35;
+    label.color.r = 1.0; label.color.g = 1.0; label.color.b = 1.0; label.color.a = 0.9;
+    label.text = "kf " + std::to_string(k);
+    kf_markers.markers.push_back(label);
+  }
+  lock.unlock();
+  kf_markers.markers.push_back(spheres);
+  this->submap_kf_pub.publish(kf_markers);
 }
 
 void dlio::OdomNode::buildKeyframesAndSubmap(State vehicle_state) {
@@ -1807,7 +2129,187 @@ void dlio::OdomNode::buildKeyframesAndSubmap(State vehicle_state) {
   // Pause to prevent stealing resources from the main loop if it is running.
   this->pauseSubmapBuildIfNeeded();
 
+  // The iVox is its own target and is updated inline after each scan, so the
+  // keyframe submap and its kd-tree are not built at all.
+  if (this->map_backend_ == "ivox") {
+    return;
+  }
+
   this->buildSubmap(vehicle_state);
+}
+
+// Push the just-aligned scan into the iVox target map. The scan is already in
+// the prior world frame, so only the GICP correction is applied here, and the
+// covariances GICP computed for the source cloud are reused with the same
+// rotation. Reusing them is what keeps the two backends comparable.
+// One line per scan, in the TUM layout: stamp tx ty tz qx qy qz qw. The stamp
+// is the scan's own, so the estimate lines up with the ground truth without any
+// offset. Flushed every line -- a run that is killed still leaves a usable
+// trajectory, and one write per 10 Hz scan costs nothing.
+void dlio::OdomNode::writeTrajectoryPose() {
+
+  if (!this->trajectory_file.is_open()) {
+    return;
+  }
+
+  this->trajectory_file << std::fixed << std::setprecision(9) << this->scan_stamp
+                        << std::setprecision(6)
+                        << " " << this->state.p[0]
+                        << " " << this->state.p[1]
+                        << " " << this->state.p[2]
+                        << " " << this->state.q.x()
+                        << " " << this->state.q.y()
+                        << " " << this->state.q.z()
+                        << " " << this->state.q.w()
+                        << std::endl;
+}
+
+void dlio::OdomNode::insertScanIntoIVox() {
+
+  if (!this->ivox_map || !this->current_scan) {
+    return;
+  }
+
+  std::shared_ptr<const nano_gicp::CovarianceList> source_covariances = this->gicp.getSourceCovariances();
+  if (!source_covariances || source_covariances->size() != this->current_scan->size()) {
+    return;
+  }
+
+  const Eigen::Matrix4d T = this->T_corr.cast<double>();
+
+  const double keep = this->ivox_insert_downsample_;
+  const size_t stride = (keep >= 1.0) ? 1 : std::max<size_t>(1, static_cast<size_t>(1.0 / keep));
+
+  pcl::PointCloud<PointType>::Ptr scan (boost::make_shared<pcl::PointCloud<PointType>>());
+  nano_gicp::CovarianceList covariances;
+  scan->reserve(this->current_scan->size() / stride + 1);
+  covariances.reserve(this->current_scan->size() / stride + 1);
+
+  for (size_t i = 0; i < this->current_scan->size(); i += stride) {
+    scan->push_back(this->current_scan->points[i]);
+    covariances.push_back(T * (*source_covariances)[i] * T.transpose());
+  }
+  pcl::transformPointCloud(*scan, *scan, this->T_corr);
+
+  this->ivox_map->set_eviction_center(this->state.p.cast<double>());
+
+  dlio::ScanWithCovariances<PointType> scan_with_covariances{scan.get(), &covariances};
+  this->ivox_map->insert(scan_with_covariances);
+
+  this->publishIVox();
+}
+
+// The iVox equivalent of the submap publisher: what GICP will register the next
+// scan against, so a target that reached into another floor is visible as such.
+void dlio::OdomNode::publishIVox() {
+
+  if (this->submap_pub.getNumSubscribers() == 0) {
+    return;
+  }
+
+  pcl::PointCloud<PointType> map;
+  for (const auto& voxel : this->ivox_map->flat_voxels) {
+    if (!voxel) {
+      continue;  // tombstoned by an eviction
+    }
+    for (size_t i = 0; i < voxel->second.size(); i++) {
+      const Eigen::Vector4d pt = small_gicp::traits::point(voxel->second, i);
+      PointType p;
+      p.x = pt[0]; p.y = pt[1]; p.z = pt[2];
+      map.push_back(p);
+    }
+  }
+
+  sensor_msgs::PointCloud2 map_ros;
+  pcl::toROSMsg(map, map_ros);
+  map_ros.header.stamp = this->scan_header_stamp;
+  map_ros.header.frame_id = this->odom_frame;
+  this->submap_pub.publish(map_ros);
+}
+
+// Point counts as a text label floating above the robot, so the scan, the
+// target map and the matches between them can be read off rviz without a
+// console. Plain rviz has no HUD, and a marker needs no extra plugin.
+void dlio::OdomNode::publishStats() {
+
+  if (this->stats_pub.getNumSubscribers() == 0) {
+    return;
+  }
+
+  size_t map_points = 0;
+  size_t map_voxels = 0;
+  size_t map_bytes = 0;
+  if (this->ivox_map) {
+    for (const auto& voxel : this->ivox_map->flat_voxels) {
+      if (!voxel) {
+        continue;  // tombstoned by an eviction
+      }
+      map_points += voxel->second.size();
+      ++map_voxels;
+      // Capacity, not size: the two vectors grow geometrically, so what is
+      // reserved is what the process actually holds.
+      map_bytes += voxel->second.points.capacity() * sizeof(Eigen::Vector4d);
+      map_bytes += voxel->second.covs.capacity() * sizeof(Eigen::Matrix4d);
+    }
+    // Per-voxel bookkeeping: the control block and pair in flat_voxels, plus
+    // one hash node and bucket slot in the coordinate map.
+    map_bytes += map_voxels * (sizeof(std::pair<small_gicp::VoxelInfo, dlio::IVoxContainer>) + 24 + 48);
+    map_bytes += this->ivox_map->flat_voxels.capacity() * sizeof(void*) * 2;
+  } else if (this->submap_cloud) {
+    map_points = this->submap_cloud->size();
+    map_bytes = map_points * sizeof(PointType);
+  }
+
+  // What the whole process holds, as the kernel sees it. The map estimate above
+  // accounts for the voxels alone; this is the number that runs a machine out.
+  double rss_mb = 0.0;
+  {
+    std::ifstream statm("/proc/self/statm");
+    long total_pages = 0, resident_pages = 0;
+    if (statm >> total_pages >> resident_pages) {
+      rss_mb = resident_pages * static_cast<double>(sysconf(_SC_PAGESIZE)) / (1024.0 * 1024.0);
+    }
+  }
+
+  std::ostringstream text;
+  text << std::fixed << std::setprecision(2);
+  text << "scan  " << this->current_scan->size() << "\n";
+  if (this->ivox_map) {
+    text << "map   " << map_points << "  (" << map_voxels << " vox)\n";
+  } else {
+    text << "map   " << map_points << "  (" << this->submap_kf_idx_curr.size() << " kf)\n";
+  }
+  text << "corr  " << this->gicp.num_correspondences << "\n";
+  text << "mem   " << (map_bytes / (1024.0 * 1024.0)) << " MB map / "
+       << rss_mb << " MB rss\n";
+  // Both move with the scene when adaptive is on, so they are worth watching
+  // live rather than reading back off the config.
+  text << "\ncorr dist  " << this->gicp.maxCorrespondenceDistance() << " m\n";
+  text << "kf dist    " << this->keyframe_thresh_dist_ << " m\n";
+  text << "kf rot     " << this->keyframe_thresh_rot_ << " deg";
+  if (this->target_points_enabled_) {
+    text << "\n\nleaf       " << this->adaptive_leaf_ << " m";
+    text << "\ntarget     " << static_cast<int>(this->last_target_points_) << " pts";
+    text << "\ncorr/leaf  " << this->corr_leaf_ratio_
+         << (this->corr_from_leaf_ ? "" : "  (off)");
+  }
+
+
+  jsk_rviz_plugins::OverlayText overlay;
+  overlay.action = jsk_rviz_plugins::OverlayText::ADD;
+  overlay.width = 260;
+  overlay.height = 230;
+  overlay.left = 10;
+  overlay.top = 10;
+  overlay.bg_color.r = 0.0; overlay.bg_color.g = 0.0; overlay.bg_color.b = 0.0;
+  overlay.bg_color.a = 0.45;
+  overlay.fg_color.r = 1.0; overlay.fg_color.g = 1.0; overlay.fg_color.b = 1.0;
+  overlay.fg_color.a = 0.95;
+  overlay.line_width = 1;
+  overlay.text_size = 11;
+  overlay.font = "DejaVu Sans Mono";
+  overlay.text = text.str();
+  this->stats_pub.publish(overlay);
 }
 
 void dlio::OdomNode::pauseSubmapBuildIfNeeded() {
