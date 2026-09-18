@@ -34,15 +34,17 @@ dlio:
   # SuperLoc corridor01 (Hawkins RC2, VLP-16 + Epson IMU), from the dataset's
   # corridor01_extrinsics.yaml. baselink is the IMU, so baselink2lidar is that
   # file's laser_to_imu and baselink2imu is identity.
+  # SuperLoc cave. baselink is the IMU, so baselink2lidar is the dataset's
+  # laser_to_imu and baselink2imu is identity.
   extrinsics:
     baselink2imu:
-      t: [ 0.,  0.,  0. ]
+      t: [ 0., 0., 0. ]
       R: [ 1.,  0.,  0.,
            0.,  1.,  0.,
            0.,  0.,  1. ]
     baselink2lidar:
-      t: [ 0.080, 0.029, 0.030 ]
-      R: [  0.999212900, -0.000519121,  0.004000000,
-            0.000516111,  0.999218492, -0.000939132,
-           -0.004000000,  0.000802565,  0.999993652 ]
+      t: [ 0.080000, 0.029000, 0.030000 ]
+      R: [ 1.000000000,  0.000000000,  0.000000000,
+           0.000000000,  1.000000000,  0.000000000,
+           0.000000000,  0.000000000,  1.000000000 ]
 
