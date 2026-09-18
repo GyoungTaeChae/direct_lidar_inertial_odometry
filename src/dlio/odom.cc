@@ -1628,6 +1628,11 @@ void dlio::OdomNode::setAdaptiveParams() {
   // Spaciousness
   float sp = this->metrics.spaciousness.back();
 
+  // Keep the raw value: the sp > 5.0 test below runs after the clamp, so
+  // comparing the clamped sp (never above 5.0) makes that branch unreachable
+  // and the correspondence distance never widens for an open scene.
+  const float sp_raw = sp;
+
   if (sp < 0.5) { sp = 0.5; }
   if (sp > 5.0) { sp = 5.0; }
 
@@ -1639,8 +1644,8 @@ void dlio::OdomNode::setAdaptiveParams() {
   if (den < 0.5*this->gicp_max_corr_dist_) { den = 0.5*this->gicp_max_corr_dist_; }
   if (den > 2.0*this->gicp_max_corr_dist_) { den = 2.0*this->gicp_max_corr_dist_; }
 
-  if (sp < 5.0) { den = 0.5*this->gicp_max_corr_dist_; };
-  if (sp > 5.0) { den = 2.0*this->gicp_max_corr_dist_; };
+  if (sp_raw < 5.0) { den = 0.5*this->gicp_max_corr_dist_; };
+  if (sp_raw > 5.0) { den = 2.0*this->gicp_max_corr_dist_; };
 
   this->gicp.setMaxCorrespondenceDistance(den);
 
