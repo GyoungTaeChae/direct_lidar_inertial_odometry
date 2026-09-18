@@ -113,6 +113,7 @@ template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::clearTarget() {
   target_.reset();
   target_covs_.reset();
+  target_ivox_.reset();
 }
 
 template <typename PointSource, typename PointTarget>
@@ -171,6 +172,11 @@ void NanoGICP<PointSource, PointTarget>::setTargetCovariances(const std::shared_
 }
 
 template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setTargetIVox(const std::shared_ptr<const IVoxTarget>& ivox) {
+  target_ivox_ = ivox;
+}
+
+template <typename PointSource, typename PointTarget>
 bool NanoGICP<PointSource, PointTarget>::calculateSourceCovariances() {
   std::shared_ptr<CovarianceList> source_covs = std::make_shared<CovarianceList>();
   std::shared_ptr<float> source_density = std::make_shared<float>();
@@ -195,7 +201,9 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(PointCloudSource&
   if (source_covs_ == nullptr || source_covs_->size() != input_->size()) {
     calculateSourceCovariances();
   }
-  if (target_covs_ == nullptr || target_covs_->size() != target_->size()) {
+  // With an iVox target the covariances travel with the map, and there is no
+  // target kd-tree to estimate them from.
+  if (!target_ivox_ && (target_covs_ == nullptr || target_covs_->size() != target_->size())) {
     calculateTargetCovariances();
   }
 
@@ -205,7 +213,7 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(PointCloudSource&
 template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::update_correspondences(const Eigen::Isometry3d& trans) {
   assert(source_covs_ != nullptr && source_covs_->size() == input_->size());
-  assert(target_covs_ != nullptr && target_covs_->size() == target_->size());
+  assert(target_ivox_ != nullptr || (target_covs_ != nullptr && target_covs_->size() == target_->size()));
 
   Eigen::Isometry3f trans_f = trans.cast<float>();
 
@@ -221,18 +229,32 @@ void NanoGICP<PointSource, PointTarget>::update_correspondences(const Eigen::Iso
     PointTarget pt;
     pt.getVector4fMap() = trans_f * input_->at(i).getVector4fMap();
 
-    target_kdtree_->nearestKSearch(pt, 1, k_indices, k_sq_dists);
+    if (target_ivox_) {
+      const Eigen::Vector4d query(pt.x, pt.y, pt.z, 1.0);
+      size_t found_index = 0;
+      double found_sq_dist = 0.0;
+      const size_t num_found = target_ivox_->nearest_neighbor_search(query, &found_index, &found_sq_dist);
 
-    sq_distances_[i] = k_sq_dists[0];
-    correspondences_[i] = k_sq_dists[0] < corr_dist_threshold_ * corr_dist_threshold_ ? k_indices[0] : -1;
+      sq_distances_[i] = num_found ? static_cast<float>(found_sq_dist) : 0.f;
+      correspondences_[i] = (num_found && found_sq_dist < corr_dist_threshold_ * corr_dist_threshold_)
+                                ? static_cast<std::int64_t>(found_index)
+                                : -1;
+    } else {
+      target_kdtree_->nearestKSearch(pt, 1, k_indices, k_sq_dists);
+
+      sq_distances_[i] = k_sq_dists[0];
+      correspondences_[i] = k_sq_dists[0] < corr_dist_threshold_ * corr_dist_threshold_ ? k_indices[0] : -1;
+    }
 
     if (correspondences_[i] < 0) {
       continue;
     }
 
-    const int target_index = correspondences_[i];
+    const std::int64_t target_index = correspondences_[i];
     const auto& cov_A = (*source_covs_)[i];
-    const auto& cov_B = (*target_covs_)[target_index];
+    const Eigen::Matrix4d cov_B =
+        target_ivox_ ? small_gicp::traits::Traits<IVoxTarget>::cov(*target_ivox_, target_index)
+                     : (*target_covs_)[target_index];
 
     Eigen::Matrix4d RCR = cov_B + trans.matrix() * cov_A * trans.matrix().transpose();
     RCR(3, 3) = 1.0;
@@ -258,14 +280,16 @@ double NanoGICP<PointSource, PointTarget>::linearize(const Eigen::Isometry3d& tr
 
 #pragma omp parallel for num_threads(num_threads_) reduction(+ : sum_errors) schedule(guided, 8)
   for (int i = 0; i < input_->size(); i++) {
-    int target_index = correspondences_[i];
+    std::int64_t target_index = correspondences_[i];
     if (target_index < 0) {
       continue;
     }
 
     const Eigen::Vector4d mean_A = input_->at(i).getVector4fMap().template cast<double>();
 
-    const Eigen::Vector4d mean_B = target_->at(target_index).getVector4fMap().template cast<double>();
+    const Eigen::Vector4d mean_B =
+        target_ivox_ ? small_gicp::traits::Traits<IVoxTarget>::point(*target_ivox_, target_index)
+                     : target_->at(target_index).getVector4fMap().template cast<double>();
 
     const Eigen::Vector4d transed_mean_A = trans * mean_A;
     const Eigen::Vector4d error = mean_B - transed_mean_A;
@@ -307,14 +331,16 @@ double NanoGICP<PointSource, PointTarget>::compute_error(const Eigen::Isometry3d
 
 #pragma omp parallel for num_threads(num_threads_) reduction(+ : sum_errors) schedule(guided, 8)
   for (int i = 0; i < input_->size(); i++) {
-    int target_index = correspondences_[i];
+    std::int64_t target_index = correspondences_[i];
     if (target_index < 0) {
       continue;
     }
 
     const Eigen::Vector4d mean_A = input_->at(i).getVector4fMap().template cast<double>();
 
-    const Eigen::Vector4d mean_B = target_->at(target_index).getVector4fMap().template cast<double>();
+    const Eigen::Vector4d mean_B =
+        target_ivox_ ? small_gicp::traits::Traits<IVoxTarget>::point(*target_ivox_, target_index)
+                     : target_->at(target_index).getVector4fMap().template cast<double>();
 
     const Eigen::Vector4d transed_mean_A = trans * mean_A;
     const Eigen::Vector4d error = mean_B - transed_mean_A;

@@ -44,6 +44,8 @@
 
 #pragma once
 
+#include <cstdint>
+
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 
@@ -51,12 +53,21 @@
 #include <pcl/point_cloud.h>
 #include <pcl/registration/registration.h>
 
+#include <small_gicp/ann/flat_container.hpp>
+#include <small_gicp/ann/incremental_voxelmap.hpp>
+
 #include "nano_gicp/lsq_registration.h"
 #include "nano_gicp/nanoflann_adaptor.h"
 
 namespace nano_gicp {
 
 typedef std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>> CovarianceList;
+
+// Alternative target map: an incremental voxel map carrying points and their
+// covariances. When one is set, correspondence search goes through it instead
+// of the target cloud + kd-tree pair. Mahalanobis weighting, linearization and
+// the solver downstream are untouched.
+typedef small_gicp::IncrementalVoxelMap<small_gicp::FlatContainer<false, true>> IVoxTarget;
 
 enum class RegularizationMethod { NONE, MIN_EIG, NORMALIZED_MIN_EIG, PLANE, FROBENIUS };
 
@@ -112,6 +123,18 @@ public:
     return target_covs_;
   }
 
+  // This class keeps its own corr_dist_threshold_, which shadows the one in
+  // pcl::Registration. The base getter therefore reports pcl's untouched
+  // default, not the distance this class actually matches against.
+  double maxCorrespondenceDistance() const { return corr_dist_threshold_; }
+
+  // Use an iVox as the target map. Pass nullptr to fall back to the kd-tree.
+  void setTargetIVox(const std::shared_ptr<const IVoxTarget>& ivox);
+
+  // Skip the kd-tree pcl::Registration::initCompute() builds over the target.
+  // Nothing in this class searches it, so building it is pure overhead.
+  void setSkipPclTargetTree(bool skip) { this->force_no_recompute_ = skip; }
+
   virtual void update_correspondences(const Eigen::Isometry3d& trans);
 
 protected:
@@ -131,6 +154,8 @@ public:
   std::shared_ptr<const CovarianceList> source_covs_;
   std::shared_ptr<const CovarianceList> target_covs_;
 
+  std::shared_ptr<const IVoxTarget> target_ivox_;
+
   float source_density_;
   float target_density_;
 
@@ -145,7 +170,7 @@ protected:
 
   CovarianceList mahalanobis_;
 
-  std::vector<int> correspondences_;
+  std::vector<std::int64_t> correspondences_;
   std::vector<float> sq_distances_;
 };
 }  // namespace nano_gicp
