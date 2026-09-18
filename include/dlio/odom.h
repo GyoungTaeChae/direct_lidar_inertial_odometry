@@ -81,6 +81,7 @@ private:
   void pushSubmapIndices(std::vector<float> dists, int k, std::vector<int> frames);
   void buildSubmap(State vehicle_state);
   void insertScanIntoIVox();
+  void classifyTouchedVoxels();
   void updateAdaptiveLeaf(const pcl::PointCloud<PointType>& probe);
   double correspondenceFromLeaf() const;
   void publishIVox();
@@ -235,6 +236,15 @@ private:
   // with, instead of the two-valued spaciousness step.
   bool   corr_from_leaf_;
   double corr_leaf_ratio_;
+
+  // After GenZ-ICP: judge each map neighbourhood planar or not, and regularize
+  // its covariance to match. A planar one weights the normal direction alone
+  // (point-to-plane); a non-planar one weights all three (point-to-point).
+  bool   planarity_split_;
+  double planarity_threshold_;
+  int    planarity_min_points_;
+  size_t planar_voxels_;
+  size_t nonplanar_voxels_;
 
   bool new_submap_is_ready;
   std::future<void> submap_future;

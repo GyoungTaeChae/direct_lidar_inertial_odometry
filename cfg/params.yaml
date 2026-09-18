@@ -107,6 +107,12 @@ dlio:
         insertPolicy: first_come
         searchOffsets: 7
         insertDownsample: 1.0
+        # After GenZ-ICP: judge each map neighbourhood planar or not and shape
+        # its covariance accordingly, so a planar one is matched point-to-plane
+        # and a cluttered one point-to-point. Stock DLIO calls everything planar.
+        planaritySplit: true
+        planarityThreshold: 0.2   # smallest eigenvalue / their sum, below = planar
+        planarityMinPoints: 5     # neighbourhood points needed before judging
     gicp:
       minNumPoints: 64
       kCorrespondences: 16

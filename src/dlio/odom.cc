@@ -338,6 +338,13 @@ void dlio::OdomNode::getParams() {
   // Drop voxels this far from the robot, the way GenZ-ICP and FAST-LIO2 trim
   // their local maps. 0 leaves the LRU horizon as the only rule.
   ros::param::param<double>("~dlio/odom/map/ivox/evictionRadius", this->ivox_eviction_radius_, 0.0);
+  // Stock DLIO regularizes every covariance to a plane, so every point is
+  // matched point-to-plane even where there is no plane. Judge it instead.
+  ros::param::param<bool>("~dlio/odom/map/ivox/planaritySplit", this->planarity_split_, false);
+  ros::param::param<double>("~dlio/odom/map/ivox/planarityThreshold", this->planarity_threshold_, 0.2);
+  ros::param::param<int>("~dlio/odom/map/ivox/planarityMinPoints", this->planarity_min_points_, 5);
+  this->planar_voxels_ = 0;
+  this->nonplanar_voxels_ = 0;
 
   // Keep the voxelized scan inside a point-count band, instead of letting the
   // fixed leaf decide how much survives in a sparse or a dense sweep.
@@ -2196,7 +2203,92 @@ void dlio::OdomNode::insertScanIntoIVox() {
   dlio::ScanWithCovariances<PointType> scan_with_covariances{scan.get(), &covariances};
   this->ivox_map->insert(scan_with_covariances);
 
+  this->classifyTouchedVoxels();
+
   this->publishIVox();
+}
+
+// Judge each voxel the last insert touched planar or not, and rewrite the
+// covariances it holds to match. The points come from the voxel and its six
+// face neighbours, the way GenZ-ICP gathers a neighbourhood, because one voxel
+// alone rarely holds enough points for the eigenvalues to mean anything.
+//
+// Nothing else in the solver changes: GICP weights a residual by the inverse of
+// the summed covariances, so a covariance flattened along its normal is already
+// a point-to-plane residual, and an isotropic one is point-to-point.
+void dlio::OdomNode::classifyTouchedVoxels() {
+
+  if (!this->planarity_split_ || !this->ivox_map) {
+    return;
+  }
+
+  static const Eigen::Vector3i face_offsets[7] = {
+    Eigen::Vector3i( 0,  0,  0), Eigen::Vector3i( 1,  0,  0), Eigen::Vector3i(-1,  0,  0),
+    Eigen::Vector3i( 0,  1,  0), Eigen::Vector3i( 0, -1,  0),
+    Eigen::Vector3i( 0,  0,  1), Eigen::Vector3i( 0,  0, -1)};
+
+  this->planar_voxels_ = 0;
+  this->nonplanar_voxels_ = 0;
+
+  for (const size_t slot : this->ivox_map->touched_voxels) {
+    auto& voxel = this->ivox_map->flat_voxels[slot];
+    if (!voxel) {
+      continue;  // tombstoned by an eviction
+    }
+
+    // Gather the neighbourhood.
+    Eigen::Vector3d centroid = Eigen::Vector3d::Zero();
+    Eigen::Matrix3d second_moment = Eigen::Matrix3d::Zero();
+    size_t count = 0;
+    for (const auto& offset : face_offsets) {
+      const auto found = this->ivox_map->voxels.find(voxel->first.coord + offset);
+      if (found == this->ivox_map->voxels.end()) {
+        continue;
+      }
+      const auto& neighbour = this->ivox_map->flat_voxels[found->second];
+      if (!neighbour) {
+        continue;
+      }
+      for (const auto& point : neighbour->second.points) {
+        const Eigen::Vector3d p = point.head<3>();
+        centroid += p;
+        second_moment += p * p.transpose();
+        ++count;
+      }
+    }
+    if (static_cast<int>(count) < this->planarity_min_points_) {
+      continue;  // too few to judge; leave the covariances as they are
+    }
+    centroid /= static_cast<double>(count);
+    second_moment /= static_cast<double>(count);
+    const Eigen::Matrix3d covariance = second_moment - centroid * centroid.transpose();
+
+    // Surface variation: the smallest eigenvalue against their sum. Near zero
+    // on a plane, near a third on a blob.
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(covariance, Eigen::ComputeEigenvectors);
+    const Eigen::Vector3d lambda = solver.eigenvalues();  // ascending
+    const double sum = lambda.sum();
+    if (!(sum > 0.0)) {
+      continue;
+    }
+    const bool is_planar = (lambda[0] / sum) < this->planarity_threshold_;
+
+    // Column 0 is the smallest eigenvalue, so it is the normal.
+    Eigen::Matrix4d regularized = Eigen::Matrix4d::Zero();
+    if (is_planar) {
+      const Eigen::Vector3d values(1e-3, 1.0, 1.0);
+      regularized.block<3, 3>(0, 0) =
+          solver.eigenvectors() * values.asDiagonal() * solver.eigenvectors().transpose();
+      ++this->planar_voxels_;
+    } else {
+      regularized.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity();
+      ++this->nonplanar_voxels_;
+    }
+
+    for (auto& cov : voxel->second.covs) {
+      cov = regularized;
+    }
+  }
 }
 
 // The iVox equivalent of the submap publisher: what GICP will register the next
@@ -2280,6 +2372,13 @@ void dlio::OdomNode::publishStats() {
     text << "map   " << map_points << "  (" << this->submap_kf_idx_curr.size() << " kf)\n";
   }
   text << "corr  " << this->gicp.num_correspondences << "\n";
+  if (this->planarity_split_) {
+    const size_t judged = this->planar_voxels_ + this->nonplanar_voxels_;
+    const double planar_fraction =
+        judged ? static_cast<double>(this->planar_voxels_) / judged : 0.0;
+    text << "planar " << planar_fraction << "  (" << this->planar_voxels_ << "/"
+         << judged << " vox)\n";
+  }
   text << "mem   " << (map_bytes / (1024.0 * 1024.0)) << " MB map / "
        << rss_mb << " MB rss\n";
   // Both move with the scene when adaptive is on, so they are worth watching
